@@ -36,6 +36,34 @@ type DurableRunRecord struct {
 	mu              sync.Mutex
 }
 
+// snapshot captures the record under its mutex so eviction logging and request
+// callbacks can read a consistent state without holding locks across I/O. The
+// copy has its own mutex, timestamp and policy; it does not track later waits.
+func (r *DurableRunRecord) snapshot() *DurableRunRecord {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	rec := &DurableRunRecord{
+		RegisteredAt:    r.RegisteredAt,
+		Key:             r.Key,
+		StepRunID:       r.StepRunID,
+		WaitKind:        r.WaitKind,
+		WaitResourceID:  r.WaitResourceID,
+		EvictionReason:  r.EvictionReason,
+		InvocationCount: r.InvocationCount,
+		waitCount:       r.waitCount,
+	}
+	if r.WaitingSince != nil {
+		waitingSince := *r.WaitingSince
+		rec.WaitingSince = &waitingSince
+	}
+	if r.EvictionPolicy != nil {
+		policy := *r.EvictionPolicy
+		rec.EvictionPolicy = &policy
+	}
+	return rec
+}
+
 // IsWaiting returns true if the run is currently in a waiting state.
 func (r *DurableRunRecord) IsWaiting() bool {
 	r.mu.Lock()

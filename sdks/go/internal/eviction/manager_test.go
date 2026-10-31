@@ -2,12 +2,78 @@ package eviction
 
 import (
 	"context"
+	"io"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// TestEvictAllWaitingConcurrentWaitReturn exercises shutdown while a durable
+// wait finishes. Logging and eviction requests must not read live wait state
+// without the record mutex, even after GetAllWaiting releases the cache lock.
+func TestEvictAllWaitingConcurrentWaitReturn(t *testing.T) {
+	logger := zerolog.New(io.Discard)
+	manager := makeTestManager(nil)
+	manager.l = &logger
+	var workers sync.WaitGroup
+	workers.Go(func() {
+		for range 10000 {
+			manager.RegisterRun("run/0", "step", 1, nil)
+			manager.MarkWaiting("run/0", "sleep", "timer")
+			manager.MarkActive("run/0")
+		}
+	})
+	workers.Go(func() {
+		for range 10000 {
+			manager.EvictAllWaiting(context.Background())
+		}
+	})
+	workers.Wait()
+}
+
+// TestEvictAllWaitingSnapshotsWaitState verifies that completing a wait during
+// the eviction request cannot change its metadata or invalidate its reason.
+// The callback creates the interleaving synchronously, without timing waits.
+func TestEvictAllWaitingSnapshotsWaitState(t *testing.T) {
+	manager := makeTestManager(nil)
+	manager.RegisterRun("run/0", "step", 1, nil)
+	manager.MarkWaiting("run/0", "sleep", "timer")
+	manager.requestEvict = func(ctx context.Context, key string, rec *DurableRunRecord) error {
+		manager.MarkActive(key)
+		require.Equal(t, "sleep", rec.WaitKind)
+		require.Equal(t, "timer", rec.WaitResourceID)
+		require.Equal(t, 1, rec.WaitCount())
+		require.NotNil(t, rec.GetWaitingSince())
+		require.Equal(t, "Worker shutdown while waiting on sleep(timer)", rec.EvictionReason)
+		return nil
+	}
+
+	require.Equal(t, 1, manager.EvictAllWaiting(context.Background()))
+}
+
+// TestTickSnapshotsWaitState verifies that periodic eviction uses the same
+// detached metadata as shutdown. Acknowledgement can outlive a durable wait;
+// finishing that wait must not mutate the record supplied to the request.
+func TestTickSnapshotsWaitState(t *testing.T) {
+	manager := makeTestManager(nil)
+	manager.RegisterRun("run/0", "step", 1, &EvictionPolicy{TTL: time.Second})
+	manager.cache.MarkWaiting("run/0", time.Now().Add(-time.Minute), "sleep", "timer")
+	manager.requestEvict = func(ctx context.Context, key string, rec *DurableRunRecord) error {
+		manager.MarkActive(key)
+		require.Equal(t, "sleep", rec.WaitKind)
+		require.Equal(t, "timer", rec.WaitResourceID)
+		require.Equal(t, 1, rec.WaitCount())
+		require.NotNil(t, rec.GetWaitingSince())
+		require.Equal(t, "Wait TTL (1s) exceeded while waiting on sleep(timer)", rec.EvictionReason)
+		return nil
+	}
+
+	require.NoError(t, manager.tick(context.Background()))
+}
 
 func makeTestManager(cancel *mockCancelLocal) *DurableEvictionManager {
 	if cancel == nil {

@@ -161,6 +161,7 @@ func (m *DurableEvictionManager) tick(ctx context.Context) error {
 		if rec == nil || rec.EvictionPolicy == nil {
 			continue
 		}
+		rec = rec.snapshot()
 
 		if m.l != nil {
 			m.l.Debug().
@@ -211,9 +212,8 @@ func (m *DurableEvictionManager) EvictAllWaiting(ctx context.Context) int {
 	evicted := 0
 
 	for _, rec := range waiting {
-		rec.mu.Lock()
+		rec = rec.snapshot()
 		rec.EvictionReason = buildEvictionReason(EvictionCauseWorkerShutdown, rec, 0)
-		rec.mu.Unlock()
 
 		if m.l != nil {
 			m.l.Debug().
